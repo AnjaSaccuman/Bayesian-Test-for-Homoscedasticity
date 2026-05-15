@@ -1,0 +1,1473 @@
+---
+title: "Bayesian Test for Homoscedasticity - Results Analysis"
+output:
+  html_document: default
+  pdf_document: default
+date: "2025-10-31"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r - packages}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(BAS)
+library(MASS)
+library(BayesFactor)
+library(stringr)
+library(rstanarm)
+library(quantreg)
+```
+
+### Introduction Graph
+```{r - Introduction Graph}
+set.seed(123)
+n <- 300 
+x <- seq(0, 1, length.out = n)
+
+df <- rbind(
+  data.frame(x = x, residual = res_homo, type = "Homoscedastic"),
+  data.frame(x = x, residual = res_hetero, type = "Heteroscedastic")
+)
+
+# Set facet order
+df$type <- factor(
+  df$type,
+  levels = c("Homoscedastic", "Heteroscedastic")
+)
+
+p_resid <- ggplot(df, aes(x = x, y = residual)) +
+  geom_point(
+    shape = 16,
+    size  = 1.6,
+    alpha = 0.55,
+    colour = "black"
+  ) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.7,
+    colour = "grey35"
+  ) +
+  facet_wrap(~ type, nrow = 1) +
+  labs(
+    x = "Predictor",
+    y = "Residuals"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.08))) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.line  = element_line(linewidth = 0.8, colour = "black"),
+    axis.ticks = element_line(linewidth = 0.8, colour = "black"),
+    axis.ticks.length = unit(3.5, "pt"),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 13),
+    panel.spacing.x = unit(10, "pt"),
+    panel.grid = element_blank()
+  )
+
+print(p_resid)
+```
+
+#   Bayesian Test for Homoscedasticity - Main Function 
+```{r - Homoscedasticity Function}
+bayesian_homoscedasticity_test <- function(
+    formula,
+    data,
+    account_uncertainty = FALSE,
+    S = 500,
+    priors = c(H0 = 1/3, H1 = 1/3, H2 = 1/3),
+    prior_reg = rstanarm::normal(0, 10),
+    evidence = c("JZS", "BIC"),
+    rscale = "medium"
+) {
+
+  evidence <- match.arg(evidence)
+
+  # ---- Prior checks ----
+  if (length(priors) != 3)
+    stop("priors must be a named vector: c(H0=..., H1=..., H2=...)")
+
+  if (!all(c("H0", "H1", "H2") %in% names(priors)))
+    stop("priors must be named c(H0=..., H1=..., H2=...)")
+
+  priors <- priors[c("H0", "H1", "H2")]
+  priors <- priors / sum(priors)
+
+  # ---- Stage 1: Mean model ----
+  fit <- rstanarm::stan_glm(
+    formula,
+    data = data,
+    prior = prior_reg,
+    chains = 4,
+    iter = 4000,
+    refresh = 0,
+    adapt_delta = 0.95
+  )
+
+  mm <- model.matrix(formula, data = data)
+  y  <- model.response(model.frame(formula, data = data))
+
+  if (ncol(mm) < 2)
+    stop("The model must include at least one predictor.")
+
+  x <- mm[, 2]
+  x_center <- scale(x, center = TRUE, scale = FALSE)
+
+  # ---- Function for posterior probabilities ----
+  compute_probs <- function(y2) {
+
+    df2 <- data.frame(
+      y2 = y2,
+      x = x_center,
+      x2 = x_center^2
+    )
+
+    if (evidence == "BIC") {
+
+      bic0 <- BIC(lm(y2 ~ 1,  data = df2))
+      bic1 <- BIC(lm(y2 ~ x,  data = df2))
+      bic2 <- BIC(lm(y2 ~ x2, data = df2))
+
+      log_m <- c(
+        H0 = -0.5 * bic0,
+        H1 = -0.5 * bic1,
+        H2 = -0.5 * bic2
+      )
+
+    } else {
+
+      bf1 <- BayesFactor::lmBF(
+        y2 ~ x,
+        data = df2,
+        rscaleCont = rscale
+      )
+
+      BF10 <- as.numeric(
+        BayesFactor::extractBF(bf1, logbf = FALSE)[1, "bf"]
+      )
+
+      bf2 <- BayesFactor::lmBF(
+        y2 ~ x2,
+        data = df2,
+        rscaleCont = rscale
+      )
+
+      BF20 <- as.numeric(
+        BayesFactor::extractBF(bf2, logbf = FALSE)[1, "bf"]
+      )
+
+      if (!is.finite(BF10) || !is.finite(BF20) ||
+          BF10 <= 0 || BF20 <= 0) {
+        return(c(H0 = NA_real_, H1 = NA_real_, H2 = NA_real_))
+      }
+
+      log_m <- c(
+        H0 = 0,
+        H1 = log(BF10),
+        H2 = log(BF20)
+      )
+    }
+
+    log_prior <- log(priors[c("H0", "H1", "H2")])
+    log_num <- log_prior + log_m
+
+    w <- exp(log_num - max(log_num))
+    post <- w / sum(w)
+
+    post
+  }
+
+  # ---- No uncertainty version ----
+  if (!account_uncertainty) {
+
+    yhat <- as.vector(
+      rstanarm::posterior_linpred(
+        fit,
+        transform = TRUE,
+        draws = 1000
+      ) %>%
+        colMeans()
+    )
+
+    res <- y - yhat
+    y2 <- res^2
+
+    post <- compute_probs(y2)
+
+    draws_out <- NULL
+    n_skipped <- NULL
+
+  } else {
+
+    # ---- Uncertainty propagation ----
+    draws <- as.matrix(fit)
+    beta_draws <- draws[, colnames(mm), drop = FALSE]
+    n_post <- nrow(beta_draws)
+
+    pick <- sample.int(n_post, S, replace = TRUE)
+
+    post_mat <- matrix(NA_real_, nrow = S, ncol = 3)
+    colnames(post_mat) <- c("H0", "H1", "H2")
+
+    for (s in seq_len(S)) {
+
+      beta_s <- beta_draws[pick[s], ]
+
+      yhat_s <- as.vector(mm %*% beta_s)
+
+      res_s <- y - yhat_s
+
+      y2_s <- res_s^2
+
+      post_mat[s, ] <- compute_probs(y2_s)
+    }
+
+    post <- colMeans(post_mat, na.rm = TRUE)
+
+    draws_out <- as.data.frame(post_mat)
+
+    n_skipped <- sum(!is.finite(post_mat[, "H0"]))
+  }
+
+  # ---- Final output ----
+  postH0 <- unname(post["H0"])
+  postH1 <- unname(post["H1"])
+  postH2 <- unname(post["H2"])
+
+  best_n <- names(which.max(c(
+    H0 = postH0,
+    H1 = postH1,
+    H2 = postH2
+  )))
+
+  interpretation <- c(
+    H0 = "Evidence supports homoscedasticity.",
+    H1 = "Evidence supports linear heteroscedasticity.",
+    H2 = "Evidence supports nonlinear heteroscedasticity."
+  )[best_n]
+
+  out <- list(
+    posterior_prob_H0 = postH0,
+    posterior_prob_H1 = postH1,
+    posterior_prob_H2 = postH2,
+    account_uncertainty = account_uncertainty,
+    S = if (account_uncertainty) S else NULL,
+    priors = priors,
+    evidence = evidence,
+    rscale = if (evidence == "JZS") rscale else NULL,
+    draws = draws_out,
+    n_skipped = n_skipped,
+    interpretation = interpretation
+  )
+
+  class(out) <- "results_simple"
+
+  out
+}
+
+
+print.results_simple <- function(x, ...) {
+
+  cat("Bayesian Test for Homoscedasticity\n")
+
+  cat(sprintf(
+    "Posterior prob (H0 - homoscedasticity)              = %.4f\n",
+    x$posterior_prob_H0
+  ))
+
+  cat(sprintf(
+    "Posterior prob (H1 - linear heteroscedasticity)     = %.4f\n",
+    x$posterior_prob_H1
+  ))
+
+  cat(sprintf(
+    "Posterior prob (H2 - nonlinear heteroscedasticity)  = %.4f\n",
+    x$posterior_prob_H2
+  ))
+
+
+  cat("\n")
+  cat(x$interpretation, "\n")
+}
+```
+
+# Results Section Analyses
+
+## 3.1 Simulation Study: Baseline Performance 
+### 3.1.1 Homoscedastic Data
+```{r - Homoscedastic Data}
+# We generate a dataset following a homoscedastic structure
+set.seed(123)
+n <- 100 
+x_homosc <- rnorm(n)
+y_homosc <- 1 + 2 * x_homosc + rnorm(n, sd = 1)
+df_homosc <- data.frame(x=x_homosc,y=y_homosc)
+
+# We fit a linear model
+lm <- lm(y_homosc ~ x_homosc)
+pred_y <- predict(lm)
+residuals <- resid(lm)
+
+# Plot 1: Variance Structure
+plot1 <- ggplot(data.frame(x_homosc, y_homosc), aes(x = x_homosc, y = y_homosc)) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    linewidth = 0.9,
+    colour = "grey30"
+  ) +
+  geom_point(
+    shape = 16,
+    size = 1.6,
+    alpha = 0.5,
+    colour = "black"
+  ) +
+  labs(
+    x = "Predictor",
+    y = "Response"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.08))) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.line  = element_line(linewidth = 0.8),
+    axis.ticks = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(3.5, "pt"),
+    panel.grid = element_blank()
+  )
+
+print(plot1)
+
+# Plot 2: Residuals vs Fitted values
+plot2 <- ggplot(
+  data.frame(Fitted = pred_y, Residuals = residuals),
+  aes(x = Fitted, y = Residuals)
+) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.7,
+    colour = "grey35"
+  ) +
+  geom_point(
+    shape = 16,
+    size = 1.6,
+    alpha = 0.55,
+    colour = "black"
+  ) +
+  labs(
+    x = "Fitted values",
+    y = "Residuals"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.08))) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.line  = element_line(linewidth = 0.8),
+    axis.ticks = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(3.5, "pt"),
+    panel.grid = element_blank()
+  )
+
+print(plot2)
+
+# TEST
+bayesian_homoscedasticity_test(formula = y_homosc ~ x_homosc, data = df_homosc)
+```
+### 3.1.2 Linear Heteroscedastic Data
+```{r - Linear Heteroscedasticity}
+# We generate a dataset following a linear heteroscedastic structure
+set.seed(123)
+n <- 100                        
+x_het_lin <- runif(n, 0, 10)    
+sigma <- 1 + 0.5 * x_het_lin         
+y_het_lin <- 1 + 2 * x_het_lin + rnorm(n, sd = sigma)
+df_het_lin <- data.frame(x_het_lin = x_het_lin, y_het_lin = y_het_lin)
+
+# We fit a linear model
+lm_het_lin         <- lm(y_het_lin ~ x_het_lin, data = df_het_lin)
+pred_y_het_lin     <- predict(lm_het_lin)
+residuals_het_lin  <- resid(lm_het_lin)
+
+# PLOT 1: Variance Structure
+plot1_het_lin <- ggplot(
+  df_het_lin,
+  aes(x = x_het_lin, y = y_het_lin)
+) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    linewidth = 0.9,
+    colour = "grey30"
+  ) +
+  geom_point(
+    shape = 16,
+    size = 1.6,
+    alpha = 0.5,
+    colour = "black"
+  ) +
+  labs(
+    x = "Predictor",
+    y = "Response"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.08))) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.line  = element_line(linewidth = 0.8),
+    axis.ticks = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(3.5, "pt"),
+    panel.grid = element_blank()
+  )
+
+print(plot1_het_lin)
+
+# PLOT 2: Residuals vs Fitted Values
+plot2_het_lin <- ggplot(
+  data.frame(
+    Fitted    = pred_y_het_lin,
+    Residuals = residuals_het_lin
+  ),
+  aes(x = Fitted, y = Residuals)
+) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.7,
+    colour = "grey35"
+  ) +
+  geom_point(
+    shape = 16,
+    size = 1.6,
+    alpha = 0.55,
+    colour = "black"
+  ) +
+  labs(
+    x = "Fitted values",
+    y = "Residuals"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.08))) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.line  = element_line(linewidth = 0.8),
+    axis.ticks = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(3.5, "pt"),
+    panel.grid = element_blank()
+  )
+print(plot2_het_lin)
+
+#TEST
+bayesian_homoscedasticity_test(formula = y_het_lin ~ x_het_lin, data = df_het_lin)
+```
+
+### 3.1.3 Nonlinear Heteroscedastic Data
+```{r - Nonlinear Heteroscedasticity}
+set.seed(13)
+n_het_nl       <- 100                             
+x_het_nl       <- runif(n_het_nl, 0, 10)         
+sigma_het_nl   <- 1 + 0.2 * (x_het_nl - mean(x_het_nl))^2           
+y_het_nl       <- 1 + 2 * x_het_nl + 
+                  rnorm(n_het_nl, sd = sigma_het_nl)
+
+df_het_nl <- data.frame(x_het_nl = x_het_nl, y_het_nl = y_het_nl)
+
+# Fit a nonlinear model
+lm_het_nl         <- lm(y_het_nl ~ x_het_nl, data = df_het_nl)
+pred_y_het_nl     <- predict(lm_het_nl)
+residuals_het_nl  <- resid(lm_het_nl)
+
+# Checking the variance structure
+# Plot 1: Variance Structure
+plot1_het_nl <- ggplot(
+  df_het_nl,
+  aes(x = x_het_nl, y = y_het_nl)
+) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    linewidth = 0.9,
+    colour = "grey30",
+    fill = "grey75"
+  ) +
+  geom_point(
+    shape = 16,
+    size = 1.6,
+    alpha = 0.5,
+    colour = "black"
+  ) +
+  labs(
+    x = "Predictor",
+    y = "Response"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.08))) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.line  = element_line(linewidth = 0.8),
+    axis.ticks = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(3.5, "pt"),
+    panel.grid = element_blank()
+  )
+
+
+print(plot1_het_nl)
+
+# Plot 2: Residuals vs Fitted values
+plot2_het_nl <- ggplot(
+  data.frame(
+    Fitted    = pred_y_het_nl,
+    Residuals = residuals_het_nl
+  ),
+  aes(x = Fitted, y = Residuals)
+) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.7,
+    colour = "grey35"
+  ) +
+  geom_point(
+    shape = 16,
+    size = 1.6,
+    alpha = 0.55,
+    colour = "black"
+  ) +
+  labs(
+    x = "Fitted values",
+    y = "Residuals"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.08))) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.line  = element_line(linewidth = 0.8),
+    axis.ticks = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(3.5, "pt"),
+    panel.grid = element_blank()
+  )
+
+print(plot2_het_nl)
+
+# TEST
+bayesian_homoscedasticity_test(formula = y_het_nl ~ x_het_nl, data = df_het_nl)
+```
+
+### Mixed Pattern: Linear and Nonlinear Heteroscedasticity
+```{r - Mixed Pattern}
+set.seed(123)
+n <- 150
+x_hybrid <- runif(n, 0, 10)
+
+# Nonlinear component decreasing as x increases,
+# linear component becomes more dominant as x increases
+sigma_hybrid <- 1 +
+  0.20 * (x_hybrid - mean(x_hybrid))^2 +
+  0.25 * x_hybrid
+
+y_hybrid <- 1 + 2 * x_hybrid + rnorm(n, sd = sigma_hybrid)
+
+df_hybrid <- data.frame(
+  x_hybrid = x_hybrid,
+  y_hybrid = y_hybrid,
+  sigma_hybrid = sigma_hybrid
+)
+
+# Fit mean model
+lm_hybrid <- lm(y_hybrid ~ x_hybrid, data = df_hybrid)
+pred_y_hybrid <- predict(lm_hybrid)
+residuals_hybrid <- resid(lm_hybrid)
+
+# Plot 1: variance structure
+plot1_hybrid <- ggplot(
+  df_hybrid,
+  aes(x = x_hybrid, y = y_hybrid)
+) +
+  geom_smooth(
+    method = "lm",
+    se = FALSE,
+    linewidth = 0.9,
+    colour = "grey30"
+  ) +
+  geom_point(
+    shape = 16,
+    size = 1.6,
+    alpha = 0.5,
+    colour = "black"
+  ) +
+  labs(
+    x = "Predictor",
+    y = "Response"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.08))) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.line  = element_line(linewidth = 0.8),
+    axis.ticks = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(3.5, "pt"),
+    panel.grid = element_blank()
+  )
+
+print(plot1_hybrid)
+
+# Plot 2: residuals vs fitted values
+plot2_hybrid <- ggplot(
+  data.frame(
+    Fitted = pred_y_hybrid,
+    Residuals = residuals_hybrid
+  ),
+  aes(x = Fitted, y = Residuals)
+) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.7,
+    colour = "grey35"
+  ) +
+  geom_point(
+    shape = 16,
+    size = 1.6,
+    alpha = 0.55,
+    colour = "black"
+  ) +
+  labs(
+    x = "Fitted values",
+    y = "Residuals"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.08))) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.line  = element_line(linewidth = 0.8),
+    axis.ticks = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(3.5, "pt"),
+    panel.grid = element_blank()
+  )
+
+print(plot2_hybrid)
+
+# TEST
+bayesian_homoscedasticity_test(formula = y_hybrid ~ x_hybrid, data = df_hybrid)
+```
+
+## 3.2 Simulation Study: Performance Across Levels of Heteroscedasticity
+### 3.2.1 Sensitivity of the Test to Increasing Levels of Linear Heteroscedasticity 
+```{r - Linear Heteroscedasticity}
+set.seed(13)
+n      <- 220
+slopes <- seq(0, 1, length.out = 10)
+x_base <- seq(-5, 5, length.out = n)
+z_base <- rnorm(n)
+all_df <- vector("list", length(slopes))
+P1     <- numeric(length(slopes))
+
+for (i in seq_along(slopes)) {
+  b      <- slopes[i]
+  x      <- x_base
+  sigma  <- 4.5 + 0.7 * b * x
+  y      <- 1 + 2 * x + sigma * z_base
+  df     <- data.frame(x = x, y = y)
+
+  fit <- lm(y ~ x, data = df)
+  all_df[[i]] <- data.frame(
+    Fitted    = predict(fit),
+    Residuals = resid(fit),
+    slope     = paste0("b = ", round(b, 2))
+  )
+
+  out   <- bayesian_homoscedasticity_test(y ~ x, data = df)
+  P1[i] <- out$posterior_prob_H1
+
+  cat(sprintf(" b = %.2f\n", b))
+  cat(sprintf("H0: %.3f   H1: %.3f\n\n",
+              out$posterior_prob_H0,
+              out$posterior_prob_H1))
+}
+
+df_all <- do.call(rbind, all_df)
+df_res <- data.frame(slope = slopes, Pr_H1 = P1)
+
+p1 <- ggplot(df_all, aes(x = Fitted, y = Residuals)) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.7,
+    colour = "grey35"
+  ) +
+  geom_point(
+    shape = 16,
+    size = 1.5,
+    alpha = 0.55,
+    colour = "black"
+  ) +
+  facet_wrap(~ slope, ncol = 5, scales = "free_x") +
+  labs(
+    x = "Fitted values",
+    y = "Residuals"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.08))) +
+  theme_classic(base_size = 13) +
+  theme(
+    axis.line  = element_line(linewidth = 0.8),
+    axis.ticks = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(3.0, "pt"),
+
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 11),
+
+    panel.spacing = unit(9, "pt"),
+    panel.grid = element_blank()
+  )
+
+print(p1)
+
+p2 <- ggplot(df_res, aes(x = slope, y = Pr_H1)) +
+  geom_line(linewidth = 0.9, colour = "grey30") +
+  geom_point(size = 2.0, colour = "black") +
+  labs(
+    x =  expression(
+      "Strength of linear heteroscedasticity ("* b *")"
+     ),
+    y = expression(Pr(H[1]))
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2),
+    expand = expansion(mult = c(0.01, 0.03))
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.line  = element_line(linewidth = 0.8),
+    axis.ticks = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(3.5, "pt"),
+    panel.grid = element_blank()
+  )
+
+print(p2)
+```
+
+### 3.2.2 Sensitivity of the Test to Increasing Levels of Nonlinear Heteroscedasticity
+```{r - Nonlinear Heteroscedasticity}
+simulate_hetero2 <- function(n = 100, beta0 = 1, beta1 = 2,
+                             sigma_base = 1, alpha = 0, k = 2) {
+  x <- runif(n, 0, 10)
+  mu <- beta0 + beta1 * x
+  sigma <- sigma_base * (1 + alpha * (x - mean(x))^k)
+  y <- rnorm(n, mean = mu, sd = sigma)
+  data.frame(y = y, x = x)
+}
+
+set.seed(23)
+n_sim  <- 10
+alphas <- seq(0, 1.0, length.out = n_sim)
+all_df <- vector("list", length(n_sim))
+P      <- numeric(length(n_sim))  
+
+for (i in seq_along(alphas)) {
+  a  <- alphas[i]
+  df <- simulate_hetero2(n = 100, alpha = a)
+
+  fit <- lm(y ~ x, data = df)
+  all_df[[i]] <- data.frame(
+    Fitted    = predict(fit),
+    Residuals = resid(fit),
+    alpha     = paste0("alpha = ", round(a, 2))
+  )
+
+  out <- bayesian_homoscedasticity_test(y ~ x, data = df)
+  P[i] <- out$posterior_prob_H2
+
+  cat(sprintf(" alpha = %.2f\n", a))
+  cat(sprintf("H0: %.3f   H2: %.3f\n\n",
+              out$posterior_prob_H0,
+              out$posterior_prob_H2))
+}
+
+df_all <- do.call(rbind, all_df)
+df_res <- data.frame(alpha = alphas, Pr_H2 = P)
+
+
+p1 <- ggplot(df_all, aes(x = Fitted, y = Residuals)) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.7,
+    colour = "grey35"
+  ) +
+  geom_point(
+    shape = 16,
+    size = 1.5,
+    alpha = 0.55,
+    colour = "black"
+  ) +
+  facet_wrap(~ alpha, ncol = 5, scales = "free_x") +
+  labs(
+    x = "Fitted values",
+    y = "Residuals"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.08))) +
+  theme_classic(base_size = 13) +
+  theme(
+    axis.line  = element_line(linewidth = 0.8),
+    axis.ticks = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(3.0, "pt"),
+
+    strip.background = element_blank(),
+
+    strip.text = element_text(face = "bold", size = 11),
+
+    panel.spacing = unit(9, "pt"),
+    panel.grid = element_blank()
+  )
+
+print(p1)
+
+p2 <- ggplot(df_res, aes(x = alpha, y = Pr_H2)) +
+  geom_line(
+    linewidth = 0.9,
+    colour = "grey30"
+  ) +
+  geom_point(
+    size = 2.0,
+    colour = "black"
+  ) +
+  labs(
+    x = expression(
+      "Strength of quadratic heterosedasticity ("*alpha*")"
+    ),
+    y = expression(Pr(H[2]))
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2),
+    expand = expansion(mult = c(0.01, 0.03))
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.line  = element_line(linewidth = 0.8),
+    axis.ticks = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(3.5, "pt"),
+    panel.grid = element_blank()
+  )
+
+
+print(p2)
+```
+
+## 3.3 Simulation Studies: Sample Size Impact 
+### 3.3.1 Linear Heteroscedasticity
+```{r - Linear Heteroscedasticity}
+set.seed(450)
+sample_sizes <- c(40, 100, 200, 500, 1000)
+b <- 0.8
+
+Pr_H1 <- numeric(length(sample_sizes))
+
+for (i in seq_along(sample_sizes)) {
+  n <- sample_sizes[i]
+  x <- runif(n, -5, 5)
+  sigma <- 4 + 0.6 * b * x
+  y <- 1 + 2 * x + rnorm(n, sd = sigma)
+  df <- data.frame(x = x, y = y)
+
+  out <- bayesian_homoscedasticity_test(y ~ x, data = df)
+
+  cat(sprintf(" n = %d\n", n))
+  cat(sprintf("H0: %.3f   H1: %.3f\n\n",
+              out$posterior_prob_H0,
+              out$posterior_prob_H1))
+
+  Pr_H1[i] <- out$posterior_prob_H1
+}
+
+df_plot <- data.frame(n = sample_sizes, Pr_H1 = Pr_H1)
+
+p_n <- ggplot(df_plot, aes(x = n, y = Pr_H1)) +
+  geom_line(
+    linewidth = 0.9,
+    colour = "grey30"
+  ) +
+  geom_point(
+    size = 2.0,
+    colour = "black"
+  ) +
+  scale_x_continuous(
+    breaks = sample_sizes,
+    expand = expansion(mult = c(0.02, 0.04))
+  ) +
+  scale_y_continuous(
+    limits = c(0.5, 1),
+    breaks = seq(0.5, 1, 0.1),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    x = "Sample size (n)",
+    y = expression(Pr(H[1]))
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.line  = element_line(linewidth = 0.8),
+    axis.ticks = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(3.5, "pt"),
+    panel.grid = element_blank()
+  )
+print(p_n)
+```
+
+### 3.3.2 Nonlinear Heteroscedasticity
+```{r - Nonlinear Heteroscedasticity}
+set.seed(12)
+sample_sizes <- c(45, 100, 200, 500, 1000)
+b <- 0.08
+
+Pr_H2 <- numeric(length(sample_sizes))
+
+for (i in seq_along(sample_sizes)) {
+  n <- sample_sizes[i]
+  x <- runif(n, 0, 10)
+  sigma <- 1 + b * (x - mean(x))^2
+  y <- 1 + 2 * x + rnorm(n, sd = sigma)
+  df <- data.frame(x = x, y = y)
+
+  out <- bayesian_homoscedasticity_test(y ~ x, data = df)
+
+  cat(sprintf(" n = %d\n", n))
+  cat(sprintf("H0: %.3f   H2: %.3f\n\n",
+              out$posterior_prob_H0,
+              out$posterior_prob_H2))
+
+  Pr_H2[i] <- out$posterior_prob_H2
+}
+
+df_plot <- data.frame(n = sample_sizes, Pr_H2 = Pr_H2)
+
+p_n_quad <- ggplot(df_plot, aes(x = n, y = Pr_H2)) +
+  geom_line(
+    linewidth = 0.9,
+    colour = "grey30"
+  ) +
+  geom_point(
+    size = 2.0,
+    colour = "black"
+  ) +
+  scale_x_continuous(
+    breaks = sample_sizes,
+    expand = expansion(mult = c(0.02, 0.04))
+  ) +
+  scale_y_continuous(
+    limits = c(0.1, 1),
+    breaks = seq(0.1, 1, 0.1),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    x = "Sample size (n)",
+    y = expression(Pr(H[2]))
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.line  = element_line(linewidth = 0.8),
+    axis.ticks = element_line(linewidth = 0.8),
+    axis.ticks.length = unit(3.5, "pt"),
+    panel.grid = element_blank()
+  )
+
+print(p_n_quad)
+```
+
+## 3.4 Prior Sensitivity Analysis: Model Priors
+```{r - All Three Hypotheses}
+set.seed(120)
+
+n <- 120
+x <- runif(n, -4, 4)
+x_center <- x - mean(x)
+x_shift <- x - min(x)
+
+df_homo <- data.frame(
+  y = 2 + 3*x + rnorm(n, 0, 1),
+  x = x
+)
+
+df_lin <- data.frame(
+  y = 2 + 3*x + rnorm(n, 0, 0.6 + 0.20*x_shift),
+  x = x
+)
+
+df_quad <- data.frame(
+  y = 2 + 3*x + rnorm(n, 0, 0.6 + 0.24*x_center^2),
+  x = x
+)
+
+datasets <- list(
+  "Homoscedastic" = df_homo,
+  "Linear heteroscedasticity" = df_lin,
+  "Quadratic heteroscedasticity" = df_quad
+)
+
+prior_vals <- seq(0.1, 0.9, length.out = 9)
+
+results_all <- list()
+
+for (scenario in names(datasets)) {
+
+  df <- datasets[[scenario]]
+  results <- data.frame()
+
+  for (pH0 in prior_vals) {
+
+    priors <- c(
+      H0 = pH0,
+      H1 = (1 - pH0) / 2,
+      H2 = (1 - pH0) / 2
+    )
+
+    test_res <- bayesian_homoscedasticity_test(
+      y ~ x,
+      data = df,
+      priors = priors,
+      account_uncertainty = FALSE
+    )
+
+    results <- rbind(results, data.frame(
+      prior_H0 = pH0,
+      post_H0 = test_res$posterior_prob_H0,
+      post_H1 = test_res$posterior_prob_H1,
+      post_H2 = test_res$posterior_prob_H2
+    ))
+  }
+
+  results_long <- results %>%
+    pivot_longer(
+      cols = c(post_H0, post_H1, post_H2),
+      names_to = "posterior",
+      values_to = "value"
+    ) %>%
+    mutate(
+      posterior = factor(
+        posterior,
+        levels = c("post_H0", "post_H1", "post_H2"),
+        labels = c("H0", "H1", "H2")
+      )
+    )
+
+  p <- ggplot(
+    results_long,
+    aes(
+      x = prior_H0,
+      y = value,
+      linetype = posterior,
+      shape = posterior
+    )
+  ) +
+    geom_line(linewidth = 0.9, colour = "grey30") +
+    geom_point(size = 2.0, colour = "black") +
+    scale_linetype_manual(values = c(H0 = "solid", H1 = "22", H2 = "42")) +
+    scale_shape_manual(values = c(H0 = 16, H1 = 17, H2 = 15)) +
+    scale_x_continuous(
+      breaks = prior_vals,
+      limits = c(0.1, 0.9),
+      expand = expansion(mult = c(0.02, 0.04))
+    ) +
+    scale_y_continuous(
+      limits = c(0, 1),
+      breaks = seq(0, 1, 0.2),
+      expand = expansion(mult = c(0.05, 0.03))
+    ) +
+    labs(
+      x = expression("Prior probability " * Pr(H[0])),
+      y = "Posterior probability",
+      linetype = NULL,
+      shape = NULL,
+      subtitle = scenario
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      axis.line = element_line(linewidth = 0.8),
+      axis.ticks = element_line(linewidth = 0.8),
+      axis.ticks.length = unit(3.5, "pt"),
+      panel.grid = element_blank(),
+      legend.position = "top",
+      legend.key.width = unit(18, "pt"),
+      plot.subtitle = element_text(face = "bold", margin = margin(b = 6))
+    )
+
+  print(p)
+
+  results_all[[scenario]] <- results
+}
+```
+
+## 3.5  Prior Sensitivity Analysis: Parameter Priors
+```{r - All Three Hypotheses}
+set.seed(30)
+n <- 100
+x <- runif(n, 0, 10)
+x_center <- x - mean(x)
+
+df_homo <- data.frame(
+  y = 2 + 3*x + rnorm(n, 0, 1),
+  x = x
+)
+
+df_lin <- data.frame(
+  y = 2 + 3*x + rnorm(n, 0, 0.5 + 0.2*x),
+  x = x
+)
+
+df_quad <- data.frame(
+  y = 2 + 3*x + rnorm(n, 0, 0.6 + 0.22*x_center^2),
+  x = x
+)
+
+datasets <- list(
+  "H0: Homoscedastic" = df_homo,
+  "H1: Linear heteroscedastic" = df_lin,
+  "H2: Quadratic heteroscedastic" = df_quad
+)
+
+jzs_scales <- c("medium", "wide", "ultrawide")
+priors <- c(H0 = 1/3, H1 = 1/3, H2 = 1/3)
+
+res_all <- list()
+
+for (nm in names(datasets)) {
+
+  df <- datasets[[nm]]
+
+  tmp_jzs <- lapply(jzs_scales, function(rsc) {
+
+    out <- bayesian_homoscedasticity_test(
+      y ~ x,
+      data = df,
+      priors = priors,
+      evidence = "JZS",
+      rscale = rsc,
+      account_uncertainty = FALSE
+    )
+
+    data.frame(
+      scenario = nm,
+      method = paste0("JZS (", rsc, ")"),
+      Pr_target = if (startsWith(nm, "H0")) {
+        out$posterior_prob_H0
+      } else if (startsWith(nm, "H1")) {
+        out$posterior_prob_H1
+      } else {
+        out$posterior_prob_H2
+      }
+    )
+  })
+
+  out_bic <- bayesian_homoscedasticity_test(
+    y ~ x,
+    data = df,
+    priors = priors,
+    evidence = "BIC",
+    account_uncertainty = FALSE
+  )
+
+  tmp_bic <- data.frame(
+    scenario = nm,
+    method = "BIC",
+    Pr_target = if (startsWith(nm, "H0")) {
+      out_bic$posterior_prob_H0
+    } else if (startsWith(nm, "H1")) {
+      out_bic$posterior_prob_H1
+    } else {
+      out_bic$posterior_prob_H2
+    }
+  )
+
+  res_all[[nm]] <- bind_rows(tmp_jzs, tmp_bic)
+}
+
+df_prior_sens <- bind_rows(res_all)
+
+df_prior_sens$method <- factor(
+  df_prior_sens$method,
+  levels = c(
+    "JZS (medium)",
+    "JZS (wide)",
+    "JZS (ultrawide)",
+    "BIC"
+  )
+)
+
+plot_one_scenario <- function(df_plot, scenario_name) {
+
+  ggplot(
+    df_plot %>% filter(scenario == scenario_name),
+    aes(x = method, y = Pr_target, group = 1)
+  ) +
+    geom_line(linewidth = 0.9, colour = "grey30") +
+    geom_point(size = 2.0, colour = "black") +
+    scale_y_continuous(
+      limits = c(0, 1),
+      breaks = seq(0, 1, 0.2),
+      expand = expansion(mult = c(0.05, 0.03))
+    ) +
+    labs(
+      title = scenario_name,
+      x = "Evidence specification",
+      y = "Posterior probability of target model"
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      axis.line = element_line(linewidth = 0.8),
+      axis.ticks = element_line(linewidth = 0.8),
+      axis.ticks.length = unit(3.5, "pt"),
+      axis.text.x = element_text(angle = 15, hjust = 1),
+      plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+      panel.grid = element_blank()
+    )
+}
+
+p_homo <- plot_one_scenario(df_prior_sens, "H0: Homoscedastic")
+p_lin  <- plot_one_scenario(df_prior_sens, "H1: Linear heteroscedastic")
+p_quad <- plot_one_scenario(df_prior_sens, "H2: Nonlinear heteroscedastic")
+
+print(p_homo)
+print(p_lin)
+print(p_quad)
+```
+
+
+## 3.6 Application to Real-Life Data
+### 3.6.1 Homoscedastic Data
+```{r - Homoscedastic Data}
+data("survey", package = "MASS")
+data_h0 <- na.omit(survey[, c("NW.Hnd", "Wr.Hnd")])
+
+# Fit linear model
+model_h0 <- lm(NW.Hnd ~ Wr.Hnd, data = data_h0)
+
+# Add fitted values and residuals to dataset
+data_h0$Fitted <- fitted(model_h0)
+data_h0$Residuals <- resid(model_h0)
+
+# 1. Variance Structure Plot
+p1_h0 <- ggplot(data_h0, aes(x = Wr.Hnd, y = NW.Hnd)) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE,
+    linewidth = 0.9,
+    colour = "grey30",
+    fill = "grey75"
+  ) +
+  geom_point(
+    shape = 16,
+    size = 1.6,
+    alpha = 0.5,
+    colour = "black"
+  ) +
+  labs(
+    x = "Writing hand span",
+    y = "Non-writing hand span"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.08))) +
+  theme_classic(base_size = 14) +
+  theme(panel.grid = element_blank())
+
+p1_h0
+
+
+# 2. Residuals vs Fitted Values
+p2_h0 <- ggplot(data_h0, aes(x = Fitted, y = Residuals)) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.7,
+    colour = "grey35"
+  ) +
+  geom_point(
+    shape = 16,
+    size = 1.6,
+    alpha = 0.55,
+    colour = "black"
+  ) +
+  labs(
+    x = "Fitted values",
+    y = "Residuals"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.08))) +
+  theme_classic(base_size = 14) +
+  theme(panel.grid = element_blank())
+
+p2_h0
+
+# BP test (linear heteroscedasticity)
+bptest(model_h0)
+
+# White test (nonlinear heteroscedasticity)
+whitestrap::white_test(model_h0)
+
+# Bayesian test
+bayesian_homoscedasticity_test(NW.Hnd ~ Wr.Hnd, data = data_h0)
+```
+
+### 3.6.2 Linear Heteroscedastic Data
+```{r - Linear Heteroscedastic Data}
+data("crabs", package = "MASS")
+data <- crabs
+
+fit_crabs <- lm(RW ~ CW, data = data)
+data$Fitted    <- predict(fit_crabs)
+data$Residuals <- resid(fit_crabs)
+
+p1_crabs <- ggplot(data, aes(x = CW, y = RW)) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE,
+    linewidth = 0.9,
+    colour = "grey30",
+    fill = "grey75"
+  ) +
+  geom_point(
+    shape = 16,
+    size = 1.6,
+    alpha = 0.5,
+    colour = "black"
+  ) +
+  labs(
+    x = "Carapace width",
+    y = "Rear width"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.08))) +
+  theme_classic(base_size = 14) +
+  theme(panel.grid = element_blank())
+
+p1_crabs
+
+p2_crabs <- ggplot(data, aes(x = Fitted, y = Residuals)) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.7,
+    colour = "grey35"
+  ) +
+  geom_point(
+    shape = 16,
+    size = 1.6,
+    alpha = 0.55,
+    colour = "black"
+  ) +
+  labs(
+    x = "Fitted values",
+    y = "Residuals"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.08))) +
+  theme_classic(base_size = 14) +
+  theme(panel.grid = element_blank())
+
+p2_crabs
+
+fit <- lm(RW ~ CW, data = data)
+
+# BP test (linear heteroscedasticity)
+bptest(fit)
+
+# White test (nonlinear heteroscedasticity)
+bptest(fit, ~ CW + I(CW^2), data = data)
+
+# Bayesian test
+bayesian_homoscedasticity_test(RW ~ CW, data = data)
+```
+
+### 3.6.3 Nonlinear Heteroscedastic Data
+```{r - Nonlinear Heteroscedastic Data}
+data("engel", package = "quantreg")
+data_t <- engel
+head(data_t)
+
+model_man <- lm(foodexp ~ income, data = data_t)
+
+data_t$Fitted <- fitted(model_man)
+data_t$Residuals <- resid(model_man)
+
+# 1. Variance Structure Plot
+p1_engel <- ggplot(data_t, aes(x = income, y = foodexp)) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE,
+    linewidth = 0.9,
+    colour = "grey30",
+    fill = "grey75"
+  ) +
+  geom_point(
+    shape = 16,
+    size = 1.6,
+    alpha = 0.5,
+    colour = "black"
+  ) +
+  labs(
+    x = "Income",
+    y = "Food expenditure"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.08))) +
+  theme_classic(base_size = 14) +
+  theme(panel.grid = element_blank())
+
+p1_engel
+
+# 2. Residuals vs Fitted Values
+p2_engel <- ggplot(data_t, aes(x = Fitted, y = Residuals)) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.7,
+    colour = "grey35"
+  ) +
+  geom_point(
+    shape = 16,
+    size = 1.6,
+    alpha = 0.55,
+    colour = "black"
+  ) +
+  labs(
+    x = "Fitted values",
+    y = "Residuals"
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(expand = expansion(mult = c(0.06, 0.08))) +
+  theme_classic(base_size = 14) +
+  theme(panel.grid = element_blank())
+
+p2_engel
+
+# BP test (linear heteroscedasticity)
+bptest(model_man)
+
+# White test (nonlinear heteroscedasticity)
+bptest(model_man, ~ income + I(income^2), data = data_t)
+
+# Bayesian test
+bayesian_homoscedasticity_test(foodexp ~ income, data = data_t)
+```
+
+## 3.7 Extended Application: Accounting for Residual Uncertainty
+```{r - Homoscedasticity}
+bayesian_homoscedasticity_test(formula = y_homosc ~ x_homosc, data = df_homosc, account_uncertainty = TRUE)
+```
+
+```{r - Linear Heteroscedasticity}
+bayesian_homoscedasticity_test(formula = y_het_lin ~ x_het_lin, data = df_het_lin, account_uncertainty = TRUE)
+```
+
+```{r - Nonlinear Heteroscedasticity}
+bayesian_homoscedasticity_test(formula = y_het_nl ~ x_het_nl, data = df_het_nl, account_uncertainty = TRUE)
+```
+
